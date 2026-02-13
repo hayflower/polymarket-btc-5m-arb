@@ -32,7 +32,20 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 ensure_venv() {
     if [ ! -d "$VENV_DIR" ]; then
         log "Creating virtual environment..."
-        python3 -m venv "$VENV_DIR"
+        python3 -m venv "$VENV_DIR" 2>/dev/null || {
+            # Minimal distros (Debian/Ubuntu) may lack ensurepip
+            log "venv creation failed -- installing python3-venv..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip
+            python3 -m venv "$VENV_DIR"
+        }
+    fi
+    # Ensure pip exists inside the venv (some distros create venv without it)
+    if [ ! -f "$PIP" ]; then
+        log "pip missing from venv, bootstrapping..."
+        "$PYTHON" -m ensurepip --upgrade 2>/dev/null || {
+            log "ensurepip unavailable, using get-pip.py..."
+            curl -sS https://bootstrap.pypa.io/get-pip.py | "$PYTHON"
+        }
     fi
 }
 
