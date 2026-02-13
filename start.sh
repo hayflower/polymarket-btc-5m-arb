@@ -29,23 +29,49 @@ PIP="$VENV_DIR/bin/pip"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-ensure_venv() {
-    if [ ! -d "$VENV_DIR" ]; then
-        log "Creating virtual environment..."
-        python3 -m venv "$VENV_DIR" 2>/dev/null || {
-            # Minimal distros (Debian/Ubuntu) may lack ensurepip
-            log "venv creation failed -- installing python3-venv..."
-            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip
-            python3 -m venv "$VENV_DIR"
-        }
+ensure_system_deps() {
+    # Debian/Ubuntu minimal images often lack python3-venv and/or ensurepip
+    if ! python3 -m venv --help &>/dev/null; then
+        log "python3-venv not available, installing..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
     fi
-    # Ensure pip exists inside the venv (some distros create venv without it)
+    if ! python3 -m pip --version &>/dev/null && ! python3 -m ensurepip --help &>/dev/null; then
+        log "pip/ensurepip not available, installing..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
+    fi
+}
+
+ensure_venv() {
+    # If venv exists but is broken (no python or no pip), remove and recreate
+    if [ -d "$VENV_DIR" ] && { [ ! -x "$PYTHON" ] || ! "$PYTHON" -c "import sys" 2>/dev/null; }; then
+        log "Removing broken venv..."
+        rm -rf "$VENV_DIR"
+    fi
+
+    if [ ! -d "$VENV_DIR" ]; then
+        ensure_system_deps
+        log "Creating virtual environment..."
+        python3 -m venv "$VENV_DIR"
+    fi
+
+    # Ensure pip exists inside the venv
     if [ ! -f "$PIP" ]; then
         log "pip missing from venv, bootstrapping..."
         "$PYTHON" -m ensurepip --upgrade 2>/dev/null || {
-            log "ensurepip unavailable, using get-pip.py..."
-            curl -sS https://bootstrap.pypa.io/get-pip.py | "$PYTHON"
+            log "ensurepip failed, using get-pip.py..."
+            curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+            "$PYTHON" /tmp/get-pip.py
+            rm -f /tmp/get-pip.py
         }
+    fi
+
+    # Final sanity check
+    if [ ! -x "$PIP" ]; then
+        log "ERROR: Could not set up pip in venv. Try manually:"
+        log "  sudo apt-get install python3-venv python3-pip"
+        log "  rm -rf $VENV_DIR"
+        log "  ./start.sh"
+        exit 1
     fi
 }
 
