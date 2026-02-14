@@ -397,54 +397,77 @@ class PolymarketAPI:
         return bps
 
     def search_crypto_markets(self, assets: list[str], durations: list[int]) -> list[dict]:
-        """Search for crypto up/down markets matching given assets and durations."""
-        markets = []
+        """Search for crypto up/down markets by constructing predictable slugs.
 
+        The Gamma API's generic listing endpoints do not reliably return
+        high-frequency recurring markets (BTC 5m, ETH 15m, etc.).
+        Instead, we construct the deterministic slug for the current and
+        upcoming windows and fetch each directly.
+
+        Slug pattern: {asset}-updown-{duration_tag}-{window_start_unix}
+        Duration tags: 5 -> "5m", 15 -> "15m", 60 -> "1h"
+        """
+        markets = []
+        now = time.time()
+
+        for asset in assets:
+            for dur_min in durations:
+                dur_sec = dur_min * 60
+                dur_tag = _DURATION_SLUG_TAGS.get(dur_min, f"{dur_min}m")
+
+                # Round down to current window start, then check current + next few
+                current_window = int(now // dur_sec) * dur_sec
+                slugs = [f"{asset}-updown-{dur_tag}-{current_window + i * dur_sec}"
+                         for i in range(-1, 4)]  # previous, current, +3 upcoming
+
+                for slug in slugs:
+                    event_list = self._get(f"{GAMMA_BASE}/events",
+                                           {"slug": slug},
+                                           self.gamma_limiter, timeout=8)
+                    if event_list and isinstance(event_list, list) and len(event_list) > 0:
+                        event = event_list[0]
+                        if event.get("active") and not event.get("closed"):
+                            match = {"asset": asset, "duration_min": dur_min}
+                            markets.append({**event, "_match": match})
+                            log.debug(f"  [discovery] Found: {event.get('title', slug)}")
+
+        if not markets:
+            log.info(f"  [discovery] No markets found via slug lookup "
+                     f"(assets={assets}, durations={durations}min). "
+                     f"Falling back to generic search...")
+            markets = self._search_crypto_markets_generic(assets, durations)
+
+        return markets
+
+    def _search_crypto_markets_generic(self, assets: list[str], durations: list[int]) -> list[dict]:
+        """Fallback: scan generic Gamma API listings (may miss recurring markets)."""
+        markets = []
         events = self._get(f"{GAMMA_BASE}/events",
                            {"limit": 200, "active": "true", "closed": "false"},
                            self.gamma_limiter, timeout=10)
         if events:
-            log.debug(f"  [discovery] Gamma /events returned {len(events)} events")
-            crypto_hits = 0
+            log.debug(f"  [discovery] Generic /events returned {len(events)} events")
             for event in events:
                 title = event.get("title", "")
                 ticker = event.get("ticker", "")
                 match = classify_market(title, ticker, assets, durations)
                 if match:
                     markets.append({**event, "_match": match})
-                elif _looks_crypto(title, ticker):
-                    crypto_hits += 1
-                    log.debug(f"  [discovery] Skipped crypto event: {title!r} (ticker={ticker!r})")
-            if crypto_hits and not markets:
-                log.info(f"  [discovery] Found {crypto_hits} crypto events but none matched "
-                         f"assets={assets} durations={durations}min — check naming")
-        else:
-            log.info("  [discovery] Gamma /events returned empty or failed")
 
         if markets:
             return markets
 
-        # Fallback to /markets endpoint
         raw = self._get(f"{GAMMA_BASE}/markets",
                         {"limit": 200, "active": "true", "closed": "false"},
                         self.gamma_limiter, timeout=10)
         if raw:
-            log.debug(f"  [discovery] Gamma /markets fallback returned {len(raw)} markets")
-            crypto_hits = 0
+            log.debug(f"  [discovery] Generic /markets returned {len(raw)} markets")
             for m in raw:
                 title = m.get("title", "")
                 ticker = m.get("groupItemTitle", "")
                 match = classify_market(title, ticker, assets, durations)
                 if match:
                     markets.append({**m, "_match": match})
-                elif _looks_crypto(title, ticker):
-                    crypto_hits += 1
-                    log.debug(f"  [discovery] Skipped crypto market: {title!r}")
-            if crypto_hits and not markets:
-                log.info(f"  [discovery] Fallback found {crypto_hits} crypto markets but none matched "
-                         f"assets={assets} durations={durations}min")
-        else:
-            log.info("  [discovery] Gamma /markets fallback also empty or failed")
         return markets
 
     def get_user_activity(self, wallet: str, limit: int = 100, offset: int = 0) -> list[dict]:
@@ -460,6 +483,10 @@ class PolymarketAPI:
 # ---------------------------------------------------------------------------
 # Market classification
 # ---------------------------------------------------------------------------
+
+# Slug tags used in Polymarket's deterministic event slugs
+# e.g. btc-updown-5m-1771027500
+_DURATION_SLUG_TAGS = {5: "5m", 15: "15m", 60: "1h"}
 
 # Duration patterns: maps regex-like patterns to minutes
 _DURATION_PATTERNS = {
@@ -963,8 +990,15 @@ def discover_markets(api: PolymarketAPI, assets: list[str] | None = None,
             parsed = parse_market(item, match_info=match_info)
             if parsed:
                 markets.append(parsed)
-    markets.sort(key=lambda m: m.end_timestamp)
-    return markets
+    # Deduplicate by condition_id (slug lookups can overlap)
+    seen: set[str] = set()
+    unique = []
+    for m in markets:
+        if m.condition_id not in seen:
+            seen.add(m.condition_id)
+            unique.append(m)
+    unique.sort(key=lambda m: m.end_timestamp)
+    return unique
 
 
 def pick_next_market(markets: list[Market], traded: set[str]) -> Market | None:
