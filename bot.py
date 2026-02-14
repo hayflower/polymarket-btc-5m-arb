@@ -870,6 +870,7 @@ class OrderExecutor:
         self._fill_count = 0
         self._maker_count = 0
         self._taker_count = 0
+        self._stats_lock = threading.Lock()
 
     def initialize(self) -> bool:
         if not self.private_key or "YOUR" in self.private_key:
@@ -898,12 +899,14 @@ class OrderExecutor:
         if size < 5:
             return None
 
-        self._order_count += 1
+        with self._stats_lock:
+            self._order_count += 1
+            order_num = self._order_count
         if self.dry_run:
             mode = "MAKER" if is_maker else "TAKER"
             log.info(f"  [DRY-{mode}] BUY {size} @ {price:.4f} (...{token_id[-8:]})")
             return {"status": "dry_run", "price": price, "size": size,
-                    "orderID": f"dry_{self._order_count}"}
+                    "orderID": f"dry_{order_num}"}
 
         try:
             from py_clob_client.order_builder.constants import BUY
@@ -913,13 +916,14 @@ class OrderExecutor:
             result = self.client.post_order(order)
             status = result.get("status", "unknown")
             order_id = result.get("orderID", "")
-            log.info(f"  Order #{self._order_count}: {status} (id={order_id[:12] if order_id else 'none'}...)")
+            log.info(f"  Order #{order_num}: {status} (id={order_id[:12] if order_id else 'none'}...)")
             if status in ("matched", "filled"):
-                self._fill_count += 1
-                if is_maker:
-                    self._maker_count += 1
-                else:
-                    self._taker_count += 1
+                with self._stats_lock:
+                    self._fill_count += 1
+                    if is_maker:
+                        self._maker_count += 1
+                    else:
+                        self._taker_count += 1
             elif status == "live":
                 log.info(f"  Order {order_id[:12]}... is live (pending fill)")
             else:
@@ -1177,15 +1181,15 @@ def execute_arb(executor: OrderExecutor, api: PolymarketAPI,
                             f"stopping early at slice {i}")
                 break
 
-        # Buy Up
-        up_result = executor.place_limit_buy(
-            market.up_token_id, current_up_price,
-            up_per_slice, market.tick_size, is_maker=is_maker)
-
-        # Buy Down
-        down_result = executor.place_limit_buy(
-            market.down_token_id, current_down_price,
-            down_per_slice, market.tick_size, is_maker=is_maker)
+        # Buy Up + Down concurrently to minimize leg risk
+        fut_up = api._pool.submit(
+            executor.place_limit_buy, market.up_token_id, current_up_price,
+            up_per_slice, market.tick_size, is_maker)
+        fut_down = api._pool.submit(
+            executor.place_limit_buy, market.down_token_id, current_down_price,
+            down_per_slice, market.tick_size, is_maker)
+        up_result = fut_up.result(timeout=10)
+        down_result = fut_down.result(timeout=10)
 
         # Track orders and update position
         if up_result:
