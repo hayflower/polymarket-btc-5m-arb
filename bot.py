@@ -470,6 +470,61 @@ class PolymarketAPI:
                     markets.append({**m, "_match": match})
         return markets
 
+    def get_market_resolution(self, condition_id: str) -> dict | None:
+        """Fetch market resolution data from Gamma API.
+
+        Returns dict with 'resolved', 'winning_outcome', 'payout_up', 'payout_down'
+        or None if not yet resolved / fetch failed.
+        """
+        result = self._get(f"{GAMMA_BASE}/markets",
+                           {"condition_id": condition_id},
+                           self.gamma_limiter, timeout=8)
+        if not result:
+            return None
+        market_data = result[0] if isinstance(result, list) and result else result
+        if not isinstance(market_data, dict):
+            return None
+
+        resolved = market_data.get("resolved", False)
+        if not resolved:
+            return None
+
+        # Outcome prices after resolution: winning side = $1, losing = $0
+        outcome_prices = market_data.get("outcomePrices", "")
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except (json.JSONDecodeError, TypeError):
+                outcome_prices = []
+
+        outcomes = market_data.get("outcomes", [])
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except (json.JSONDecodeError, TypeError):
+                outcomes = []
+
+        payout_up = 0.0
+        payout_down = 0.0
+        winning = "unknown"
+        for i, outcome in enumerate(outcomes):
+            price = float(outcome_prices[i]) if i < len(outcome_prices) else 0.0
+            if str(outcome).lower() == "up":
+                payout_up = price
+                if price > 0.5:
+                    winning = "up"
+            elif str(outcome).lower() == "down":
+                payout_down = price
+                if price > 0.5:
+                    winning = "down"
+
+        return {
+            "resolved": True,
+            "winning_outcome": winning,
+            "payout_up": payout_up,
+            "payout_down": payout_down,
+        }
+
     def get_user_activity(self, wallet: str, limit: int = 100, offset: int = 0) -> list[dict]:
         return self._get(f"{DATA_BASE}/activity",
                          {"user": wallet, "limit": limit, "offset": offset},
@@ -858,19 +913,37 @@ class OrderExecutor:
             result = self.client.post_order(order)
             status = result.get("status", "unknown")
             order_id = result.get("orderID", "")
-            log.info(f"  Order #{self._order_count}: {status} (id={order_id[:12]}...)")
-            if status == "matched" or order_id:
+            log.info(f"  Order #{self._order_count}: {status} (id={order_id[:12] if order_id else 'none'}...)")
+            if status in ("matched", "filled"):
                 self._fill_count += 1
                 if is_maker:
                     self._maker_count += 1
                 else:
                     self._taker_count += 1
+            elif status == "live":
+                log.info(f"  Order {order_id[:12]}... is live (pending fill)")
             else:
-                log.warning(f"  Possible non-fill: {result}")
+                log.warning(f"  Unexpected order status: {result}")
             return result
         except Exception as e:
             log.error(f"  Order failed: {e}")
             return None
+
+    def get_balance(self) -> float | None:
+        """Fetch available USDC balance from CLOB. Returns None if unavailable."""
+        if self.dry_run or not self.client:
+            return None
+        try:
+            # py-clob-client get_balance_allowance returns
+            # {"balance": "...", "allowance": "..."}  (USDC in wei-like units)
+            bal_info = self.client.get_balance_allowance()
+            if bal_info and "balance" in bal_info:
+                # Balance is returned as a string in USDC atomic units (6 decimals)
+                raw = float(bal_info["balance"])
+                return raw / 1e6
+        except Exception as e:
+            log.warning(f"  Failed to fetch balance: {e}")
+        return None
 
     def check_order(self, order_id: str) -> dict | None:
         """Check the status of an order. Returns order details or None."""
@@ -1322,9 +1395,24 @@ def run_bot():
             live_fee_bps = fetch_market_fees(api, market)
             log.info(f"  Ends: {market.end_date} | Live fee_bps: {live_fee_bps}")
 
+            # Verify actual USDC balance on exchange
+            actual_balance = executor.get_balance()
+            if actual_balance is not None:
+                if actual_balance < 10:
+                    log.warning(f"  Insufficient exchange balance: "
+                                f"${actual_balance:.2f} USDC. Waiting...")
+                    time.sleep(60)
+                    continue
+                # Cap available capital to actual balance
+                if actual_balance < capital.available:
+                    log.info(f"  Exchange balance ${actual_balance:.2f} < "
+                             f"tracked ${capital.available:.2f}, using actual")
+
             # Check capital
-            if capital.available < 10:
-                log.warning(f"  Insufficient capital: ${capital.available:.2f} available. Waiting...")
+            available = min(capital.available, actual_balance) \
+                if actual_balance is not None else capital.available
+            if available < 10:
+                log.warning(f"  Insufficient capital: ${available:.2f} available. Waiting...")
                 time.sleep(60)
                 continue
 
@@ -1351,7 +1439,7 @@ def run_bot():
             while time.time() < deadline:
                 snapshot = get_snapshot(api, market)
                 plan = strategy.evaluate(snapshot,
-                                         available_capital=capital.available,
+                                         available_capital=available,
                                          fee_rate_bps=live_fee_bps,
                                          tick_size=market.tick_size)
                 if plan:
@@ -1399,9 +1487,26 @@ def run_bot():
             else:
                 time.sleep(60)
 
-            # After resolution: one side pays $1, other pays $0
-            # Only paired shares are guaranteed; excess is 50/50
-            payout = position.pairs
+            # Query actual resolution -- retry a few times since resolution
+            # can lag behind end_timestamp by seconds to minutes
+            resolution = None
+            for _attempt in range(6):
+                resolution = api.get_market_resolution(market.condition_id)
+                if resolution and resolution["resolved"]:
+                    break
+                log.info(f"  Waiting for resolution data (attempt {_attempt + 1}/6)...")
+                time.sleep(10)
+            if resolution and resolution["resolved"]:
+                payout_up = resolution["payout_up"]
+                payout_down = resolution["payout_down"]
+                payout = (position.up_shares * payout_up
+                          + position.down_shares * payout_down)
+                log.info(f"  Resolution: {resolution['winning_outcome'].upper()} won | "
+                         f"payout_up={payout_up} payout_down={payout_down}")
+            else:
+                # Fallback: assume paired shares pay $1 (one side wins)
+                payout = position.pairs
+                log.warning(f"  Resolution data unavailable, estimating payout from pairs")
             capital.resolve(position.total_invested, payout)
             log.info(f"  Resolved. Payout: ${payout:.2f} | {capital}")
 
