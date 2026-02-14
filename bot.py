@@ -47,8 +47,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_log_level = logging.DEBUG if os.getenv("DEBUG", "").lower() in ("1", "true", "yes") else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -403,11 +404,22 @@ class PolymarketAPI:
                            {"limit": 200, "active": "true", "closed": "false"},
                            self.gamma_limiter, timeout=10)
         if events:
+            log.debug(f"  [discovery] Gamma /events returned {len(events)} events")
+            crypto_hits = 0
             for event in events:
-                match = classify_market(event.get("title", ""), event.get("ticker", ""),
-                                        assets, durations)
+                title = event.get("title", "")
+                ticker = event.get("ticker", "")
+                match = classify_market(title, ticker, assets, durations)
                 if match:
                     markets.append({**event, "_match": match})
+                elif _looks_crypto(title, ticker):
+                    crypto_hits += 1
+                    log.debug(f"  [discovery] Skipped crypto event: {title!r} (ticker={ticker!r})")
+            if crypto_hits and not markets:
+                log.info(f"  [discovery] Found {crypto_hits} crypto events but none matched "
+                         f"assets={assets} durations={durations}min — check naming")
+        else:
+            log.info("  [discovery] Gamma /events returned empty or failed")
 
         if markets:
             return markets
@@ -417,11 +429,22 @@ class PolymarketAPI:
                         {"limit": 200, "active": "true", "closed": "false"},
                         self.gamma_limiter, timeout=10)
         if raw:
+            log.debug(f"  [discovery] Gamma /markets fallback returned {len(raw)} markets")
+            crypto_hits = 0
             for m in raw:
-                match = classify_market(m.get("title", ""), m.get("groupItemTitle", ""),
-                                        assets, durations)
+                title = m.get("title", "")
+                ticker = m.get("groupItemTitle", "")
+                match = classify_market(title, ticker, assets, durations)
                 if match:
                     markets.append({**m, "_match": match})
+                elif _looks_crypto(title, ticker):
+                    crypto_hits += 1
+                    log.debug(f"  [discovery] Skipped crypto market: {title!r}")
+            if crypto_hits and not markets:
+                log.info(f"  [discovery] Fallback found {crypto_hits} crypto markets but none matched "
+                         f"assets={assets} durations={durations}min")
+        else:
+            log.info("  [discovery] Gamma /markets fallback also empty or failed")
         return markets
 
     def get_user_activity(self, wallet: str, limit: int = 100, offset: int = 0) -> list[dict]:
@@ -455,6 +478,13 @@ _ASSET_ALIASES = {
     "avax": ["avax", "avalanche"],
     "link": ["link", "chainlink"],
 }
+
+
+def _looks_crypto(title: str, ticker: str) -> bool:
+    """Quick check if a market title/ticker mentions any known crypto asset."""
+    combined = (title + " " + ticker).lower()
+    all_aliases = [alias for aliases in _ASSET_ALIASES.values() for alias in aliases]
+    return any(alias in combined for alias in all_aliases)
 
 
 def classify_market(title: str, ticker: str,
@@ -1224,6 +1254,7 @@ def run_bot():
     traded_markets: set[str] = set()
     positions: list[Position] = []
     windows_scanned = 0
+    first_scan = True
 
     while True:
         try:
@@ -1234,7 +1265,14 @@ def run_bot():
                 continue
 
             log.info(f"Scanning... {capital}")
+            # Force verbose discovery on first scan to aid debugging
+            if first_scan:
+                _prev_level = log.getEffectiveLevel()
+                logging.getLogger().setLevel(logging.DEBUG)
             all_markets = discover_markets(api)
+            if first_scan:
+                logging.getLogger().setLevel(_prev_level)
+                first_scan = False
             log.info(f"  Found {len(all_markets)} active markets "
                      f"({','.join(ENABLED_ASSETS)} / {durations_str})")
 
