@@ -1188,8 +1188,54 @@ def execute_arb(executor: OrderExecutor, api: PolymarketAPI,
         fut_down = api._pool.submit(
             executor.place_limit_buy, market.down_token_id, current_down_price,
             down_per_slice, market.tick_size, is_maker)
-        up_result = fut_up.result(timeout=10)
-        down_result = fut_down.result(timeout=10)
+
+        try:
+            up_result = fut_up.result(timeout=10)
+        except Exception as e:
+            log.error(f"  Up order future failed: {e}")
+            up_result = None
+        try:
+            down_result = fut_down.result(timeout=10)
+        except Exception as e:
+            log.error(f"  Down order future failed: {e}")
+            down_result = None
+
+        # Detect one-legged fill and recover
+        if up_result and not down_result:
+            up_oid = up_result.get("orderID", "")
+            up_status = up_result.get("status", "")
+            if is_maker and up_oid and not up_oid.startswith("dry_"):
+                executor.cancel_order(up_oid)
+                log.warning(f"  Asymmetric fill: Up succeeded, Down failed. "
+                            f"Cancelled Up order {up_oid[:12]}...")
+            elif up_status in ("matched", "filled"):
+                log.warning(f"  Asymmetric taker fill: Up filled but Down failed. "
+                            f"Exposed {up_per_slice} Up shares. Stopping slices.")
+                position.up_shares += up_per_slice
+                position.up_cost += up_per_slice * current_up_price
+                position.orders_placed += 1
+                position.orders_filled += 1
+                position.taker_fills += 1
+            break
+        if down_result and not up_result:
+            down_oid = down_result.get("orderID", "")
+            down_status = down_result.get("status", "")
+            if is_maker and down_oid and not down_oid.startswith("dry_"):
+                executor.cancel_order(down_oid)
+                log.warning(f"  Asymmetric fill: Down succeeded, Up failed. "
+                            f"Cancelled Down order {down_oid[:12]}...")
+            elif down_status in ("matched", "filled"):
+                log.warning(f"  Asymmetric taker fill: Down filled but Up failed. "
+                            f"Exposed {down_per_slice} Down shares. Stopping slices.")
+                position.down_shares += down_per_slice
+                position.down_cost += down_per_slice * current_down_price
+                position.orders_placed += 1
+                position.orders_filled += 1
+                position.taker_fills += 1
+            break
+        if not up_result and not down_result:
+            log.warning(f"  Both legs failed on slice {i}, stopping early.")
+            break
 
         # Track orders and update position
         if up_result:
@@ -1232,6 +1278,10 @@ def execute_arb(executor: OrderExecutor, api: PolymarketAPI,
         log.info(f"  Verifying {len(pending_orders)} maker orders...")
         time.sleep(MAKER_FILL_TIMEOUT_SEC)
 
+        filled_up = 0.0
+        filled_down = 0.0
+        unfilled_orders: list[dict] = []
+
         for order in pending_orders:
             fill_info = executor.verify_fill(order["id"], timeout=2.0)
             if fill_info["filled"]:
@@ -1241,15 +1291,28 @@ def execute_arb(executor: OrderExecutor, api: PolymarketAPI,
                 if order["side"] == "up":
                     position.up_shares += size
                     position.up_cost += size * order["price"]
+                    filled_up += size
                 else:
                     position.down_shares += size
                     position.down_cost += size * order["price"]
+                    filled_down += size
                 position.orders_filled += 1
                 position.maker_fills += 1
             else:
-                executor.cancel_order(order["id"])
-                log.info(f"  Unfilled {order['side']} order cancelled "
-                         f"({order['size']} @ {order['price']:.4f})")
+                unfilled_orders.append(order)
+
+        # Cancel all unfilled orders
+        for order in unfilled_orders:
+            executor.cancel_order(order["id"])
+            log.info(f"  Unfilled {order['side']} order cancelled "
+                     f"({order['size']} @ {order['price']:.4f})")
+
+        # Check for asymmetric fills after maker verification
+        excess = abs(filled_up - filled_down)
+        if excess > 0 and min(filled_up, filled_down) > 0:
+            heavier = "Up" if filled_up > filled_down else "Down"
+            log.warning(f"  Asymmetric maker fills: Up={filled_up:.0f} Down={filled_down:.0f} "
+                        f"({excess:.0f} unhedged {heavier} shares)")
 
     # For dry run with maker mode, credit the positions optimistically
     if is_maker and executor.dry_run:
